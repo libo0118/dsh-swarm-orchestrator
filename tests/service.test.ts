@@ -126,6 +126,8 @@ class FakeSubagents {
   service?: SwarmService
   /** How many children failed because an effort was pinned. */
   effortErrorCount = 0
+  /** Every spec an activation-mounted host received, in call order. */
+  readonly activationSpecs: Array<{ label: string } & Record<string, unknown>> = []
   private readonly held: Array<() => void> = []
   private n = 0
   private failedOnce = false
@@ -213,6 +215,33 @@ class FakeSubagents {
   /** Resolve all held children. */
   release(): void {
     this.held.splice(0).forEach((fn) => { fn() })
+  }
+
+  /**
+   * Present this fake as a 0.2.2-rc.3 host: `start()` is gone and the only way to
+   * a child is `startActivation({ provider, delivery, label, ... })`. The
+   * activation wraps the same scripted child, so every knob above (unavailable,
+   * quota, hold, fail scripts) keeps working through the new seam.
+   */
+  asActivationHost(): {
+    startActivation(spec: { label: string } & Record<string, unknown>): Promise<{
+      childId: string
+      name: string
+      result: Promise<unknown>
+      dispose(): Promise<void>
+    }>
+  } {
+    return {
+      startActivation: async (spec) => {
+        this.activationSpecs.push(spec)
+        const handle = this.start('spawn', spec as never) as unknown as {
+          id: string
+          result: Promise<unknown>
+          dispose(): Promise<void>
+        }
+        return { childId: handle.id, name: handle.id, result: handle.result, dispose: () => handle.dispose() }
+      },
+    }
   }
 }
 
@@ -361,7 +390,15 @@ async function pumpUntil(
   throw new Error(`unreachable after ${turns} dispatcher turns: ${what}`)
 }
 
-async function bootSwarm(overrides: Record<string, unknown> = {}): Promise<{ ctx: Context; service: SwarmService; fake: FakeSubagents; shell: FakeEvidenceShell; dir: string }> {
+async function bootSwarm(
+  overrides: Record<string, unknown> = {},
+  /**
+   * Which shape of subagents service the host mounts. `'start'` is the legacy
+   * `start(provider, request)` service; `'activation'` is a 0.2.2-rc.3 host that
+   * only offers `startActivation(spec)`.
+   */
+  host: 'start' | 'activation' = 'start',
+): Promise<{ ctx: Context; service: SwarmService; fake: FakeSubagents; shell: FakeEvidenceShell; dir: string }> {
   const dir = mkdtempSync(join(tmpdir(), 'swarm-service-'))
   // J21: the effort preflight reads `$DSH_HOME/settings.yaml`. Point it at a fixture
   // deployment for every boot, so these tests neither depend on (nor are fooled by)
@@ -372,7 +409,7 @@ async function bootSwarm(overrides: Record<string, unknown> = {}): Promise<{ ctx
   const ctx = new Context()
   const fake = new FakeSubagents()
   const shell = new FakeEvidenceShell()
-  ctx.reflect.provide('subagents', fake as never)
+  ctx.reflect.provide('subagents', (host === 'activation' ? fake.asActivationHost() : fake) as never)
   ctx.reflect.provide('shell', shell as never)
   ctx.reflect.provide('sandboxPolicy', { resolve: () => ({ mode: 'workspace-write', workspaceRoot: dir }) } as never)
   await ctx.plugin(swarmPlugin, {
@@ -549,6 +586,44 @@ describe('swarm service (integration, fake subagents)', () => {
 
     await waitFor(() => service.snapshot().tasks.find((t) => t.id === 'a')?.status === 'completed', 3000, 'task completion after fallback')
     expect(service.snapshot().tasks.find((t) => t.id === 'a')?.agent?.model).toBe('deepseek-v4')
+  })
+
+  it('spawns through the startActivation seam of a host that no longer has start()', async () => {
+    // 0.2.2-rc.3 dropped `subagents.start(provider, request)`; only
+    // `startActivation(spec)` remains. The orchestrator must reach the child
+    // anyway, and must not forward the fields that API retired.
+    const { ctx, service, fake, dir } = await bootSwarm({}, 'activation')
+    contexts.push(ctx)
+    dirs.push(dir)
+
+    const table = structuredClone(service.duty.get())
+    table.roles.builder = { ...table.roles.builder, provider: 'zai', model: 'glm-5.3', persona: 'write plainly' }
+    service.setDutyTable(table, 'test')
+
+    const result = service.dispatch({
+      title: 'activation host',
+      spec: 's',
+      tasks: [{ id: 'a', subject: 'Write the thing', description: 'Write it well.', role: 'builder' }],
+    }, makeDispatcher() as never)
+    service.endorse(result.runId)
+
+    await waitFor(() => fake.calls.length >= 1, 3000, 'activation spawn')
+    expect(fake.calls[0]?.agentOptions?.provider).toBe('zai')
+    expect(fake.calls[0]?.agentOptions?.model).toBe('glm-5.3')
+    expect(fake.calls[0]?.label).toBe('swarm:a')
+    expect(fake.calls[0]?.prompt[0]?.text).toContain('Write it well.')
+
+    // The spec keeps the routing and the label, and drops what the activation
+    // API retired: a child's persona and tools now come from its agent preset.
+    const spec = fake.activationSpecs[0]!
+    expect(spec.provider).toBe('spawn')
+    expect(spec.delivery).toBe('caller')
+    expect(spec.label).toBe('swarm:a')
+    expect(spec).not.toHaveProperty('persona')
+    expect(spec).not.toHaveProperty('toolFilter')
+
+    // The activation's `childId`/`result` feed the same dispatch pipeline.
+    await waitFor(() => service.snapshot().tasks.find((t) => t.id === 'a')?.status === 'completed', 3000, 'task completion through the activation seam')
   })
 
   it('review rejection requeues the task with feedback, then approves on rework', async () => {

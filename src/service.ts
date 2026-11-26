@@ -40,6 +40,104 @@ declare module '@deepseek-ai/dsh-llm' {
   }
 }
 
+/** The handle a spawn-provider start returns: identity, settlement, disposal. */
+interface SubagentSpawnHandle {
+  id: string
+  result: Promise<{
+    output: Array<{ type: string; text?: string }>
+    stopReason: string
+    diagnostic?: string
+  }>
+  dispose(): Promise<void>
+}
+
+/**
+ * One established child under the activation API that replaced `start()`.
+ *
+ * Host 0.2.2-rc.3 renamed the identity (`childId` for `id`) and returns the same
+ * settlement promise; the execution period itself is called an activation.
+ */
+interface SubagentActivationLike {
+  childId: string
+  result: Promise<{
+    readonly output: ReadonlyArray<{ type: string; text?: string }>
+    stopReason: string
+    diagnostic?: string
+  }>
+  dispose(): Promise<void>
+}
+
+/** The activation spec this plugin fills: the start request minus the retired fields. */
+interface SubagentActivationSpecLike {
+  provider: string
+  delivery: 'parent' | 'caller'
+  label: string
+  prompt: Array<{ type: 'text'; text: string }>
+  parent: Agent
+  signal: AbortSignal
+  agentOptions?: { provider?: string; model?: string; maxTokens?: number; reasoningEffort?: string }
+  maxDepth?: number
+}
+
+/**
+ * The `ctx.subagents` surface this plugin drives, across host API generations.
+ *
+ * `start(provider, request)` is the pre-0.2.2 entry point. Host 0.2.2-rc.3 removed
+ * it outright — a host that installs that release exposes `startActivation` and
+ * nothing else — so the plugin declares both and picks whichever the host mounts.
+ */
+interface SubagentSpawnSeam {
+  /** Hosts up to 0.2.1: start a provider run directly. */
+  start?(provider: string, request: unknown): Promise<SubagentSpawnHandle> | SubagentSpawnHandle
+  /** Hosts from 0.2.2-rc.3: establish the child as a managed activation. */
+  startActivation?(spec: SubagentActivationSpecLike): Promise<SubagentActivationLike>
+}
+
+/**
+ * Establish the spawn-provider child through the activation API.
+ *
+ * The request maps field for field onto the spec: `parent`, `prompt`, `signal`,
+ * `agentOptions` and `maxDepth` are the same inputs the retired `start()` took,
+ * and the activation hands back the same settlement promise and disposal — only
+ * the names differ (`childId` for `id`). `delivery: 'caller'` keeps the child's
+ * settlement out of the parent model's queue: the swarm owns the notice itself,
+ * exactly as the caller-delivered start did.
+ *
+ * `persona`, `toolFilter` and `evidenceWarnings` are dropped on purpose. The
+ * activation API retired them (a child's persona and tools now come from an Agent
+ * Preset), and a retired field forwarded as an unknown property would be a silent
+ * no-op that reads like a working restriction.
+ *
+ * `label` survives as the task label but is no longer optional; the dispatcher
+ * always supplies one, and the fallback keeps a host-level validation error from
+ * failing a task that would otherwise run fine.
+ */
+function activateSpawn(
+  subagents: SubagentSpawnSeam,
+  request: Parameters<SpawnDeps['start']>[0],
+): Promise<SubagentSpawnHandle> {
+  const startActivation = subagents.startActivation
+  if (startActivation === undefined) throw new Error('subagents service has neither start nor startActivation')
+  return startActivation.call(subagents, {
+    provider: 'spawn',
+    delivery: 'caller',
+    label: request.label ?? 'swarm task',
+    prompt: request.prompt,
+    parent: request.parent,
+    signal: request.signal,
+    ...(request.agentOptions === undefined ? {} : { agentOptions: request.agentOptions }),
+    ...(request.maxDepth === undefined ? {} : { maxDepth: request.maxDepth }),
+  }).then((activation) => ({
+    id: activation.childId,
+    result: activation.result.then((settled) => ({
+      output: [...settled.output],
+      stopReason: settled.stopReason,
+      ...(settled.diagnostic === undefined ? {} : { diagnostic: settled.diagnostic }),
+    })),
+    dispose: () => activation.dispose(),
+  }))
+}
+
 /**
  * J15: drop tool names a host does not expose from a role's toolFilter.
  *
@@ -2706,9 +2804,15 @@ export class SwarmService extends Service {
   private spawnDeps(): SpawnDeps {
     return {
       start: (request) => {
-        const subagents = this.ctx.get('subagents') as { start(provider: string, request: unknown): unknown } | undefined
+        const subagents = this.ctx.get('subagents') as SubagentSpawnSeam | undefined
         if (subagents === undefined) throw new Error('subagents service unavailable in this host (spawn provider not mounted?)')
-        return subagents.start('spawn', request as never) as never
+        // The original entry point, kept first so a host that still has it keeps
+        // its exact behaviour. 0.2.2-rc.3 removed start() in favour of
+        // startActivation(), and a host with neither is a broken mount, not a
+        // silent no-op.
+        if (typeof subagents.start === 'function') return subagents.start('spawn', request) as Promise<SubagentSpawnHandle>
+        if (typeof subagents.startActivation === 'function') return activateSpawn(subagents, request)
+        throw new Error('subagents service has neither start nor startActivation')
       },
     }
   }

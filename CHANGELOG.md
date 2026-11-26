@@ -2,6 +2,13 @@
 
 Notable changes to `dsh-swarm-orchestrator`. Versions follow the npm package.
 
+## 0.6.35 — spawns on a host that dropped `subagents.start`
+
+- Reach a child through `subagents.startActivation({ provider, delivery, label, prompt, parent, signal, agentOptions, maxDepth })` when the host no longer exposes `start(provider, request)`. `@deepseek-ai/dsh-subagent` 0.2.2-rc.3 retired `start`, so every spawn — dispatch, review and integrator alike — failed on that host before a child was ever created.
+- Keep the legacy seam first: a host that still has `start` is called exactly as before, byte for byte, so existing installs keep their behaviour. Only a host without `start` takes the activation path, and a host with neither fails with `subagents service has neither start nor startActivation` instead of a raw `TypeError`.
+- Map the activation's own shape back to the dispatch contract: `childId` becomes the spawn id, `result` resolves to `{ output, stopReason, diagnostic }`, and `dispose()` forwards to the activation. Fields the activation API retired — `persona`, `toolFilter`, `evidenceWarnings` — are dropped on purpose, because a child's persona and tools now come from its Agent preset and forwarding them is rejected. `label` falls back to `swarm task` because the activation spec requires one.
+- Regressions: an activation-only host spawns, routes `provider`/`model` from the duty table, keeps the `swarm:<task>` label, forwards neither retired field, and completes the task through the same dispatch pipeline. Full suite: 1,010 tests across 39 files.
+
 ## 0.6.34 — roster localization and runtime alignment
 
 - Built-in Roster role names follow the interface language. The `architect` / `builder` / `reviewer` / `integrator` card headers render 架构设计 / 干活出工 / 测试复查 / 整合收拢 in Chinese; a label customized under 人设与描述 always wins, custom roles keep their own name, and the stored duty table is never rewritten by a translation (the role id and the editable display-label field stay untouched).
